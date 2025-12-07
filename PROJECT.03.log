@@ -1,0 +1,161 @@
+# youtube_dashboard.py
+
+import os
+import pandas as pd
+import streamlit as st
+import plotly.express as px
+from googleapiclient.discovery import build
+
+# ----------------------------------------------------
+# 1. BASIC CONFIG
+# ----------------------------------------------------
+st.set_page_config(page_title="YouTube Data Dashboard", layout="wide")
+st.title("YouTube Data Dashboard with Streamlit")
+
+# Put your API key in an environment variable or directly here
+API_KEY = os.getenv("YOUTUBE_API_KEY", "YOUR_API_KEY_HERE")
+YOUTUBE = build("youtube", "v3", developerKey=API_KEY)
+
+# ----------------------------------------------------
+# 2. SIDEBAR INPUTS
+# ----------------------------------------------------
+st.sidebar.header("Settings")
+channel_id = st.sidebar.text_input(
+    "Channel ID",
+    value="UC_x5XG1OV2P6uZZ5FSM9Ttw",  # example: Google Developers channel[web:7]
+)
+max_results = st.sidebar.slider("Number of videos", 5, 50, 20)
+sort_by = st.sidebar.selectbox(
+    "Sort top-performing videos by",
+    ("viewCount", "likeCount", "commentCount", "publishedAt"),
+)
+
+# ----------------------------------------------------
+# 3. HELPER FUNCTIONS (YouTube Data API)
+# ----------------------------------------------------
+def get_uploads_playlist_id(cid: str) -> str:
+    """Return uploads playlist id for a channel."""
+    resp = YOUTUBE.channels().list(
+        part="contentDetails", id=cid
+    ).execute()
+    items = resp.get("items", [])
+    if not items:
+        return None
+    return items[0]["contentDetails"]["relatedPlaylists"]["uploads"]
+
+def get_videos_from_playlist(playlist_id: str, max_results: int = 20):
+    """Return basic info for latest videos in a playlist."""
+    resp = YOUTUBE.playlistItems().list(
+        part="snippet", playlistId=playlist_id, maxResults=max_results
+    ).execute()
+    items = resp.get("items", [])
+    video_ids = [it["snippet"]["resourceId"]["videoId"] for it in items]
+    return video_ids, items
+
+def get_video_stats(video_ids):
+    """Return statistics for given video IDs."""
+    if not video_ids:
+        return pd.DataFrame()
+    resp = YOUTUBE.videos().list(
+        part="snippet,statistics,contentDetails",
+        id=",".join(video_ids),
+    ).execute()
+    rows = []
+    for v in resp.get("items", []):
+        stats = v.get("statistics", {})
+        snippet = v.get("snippet", {})
+        rows.append(
+            {
+                "video_id": v["id"],
+                "title": snippet.get("title", ""),
+                "publishedAt": snippet.get("publishedAt", ""),
+                "views": int(stats.get("viewCount", 0)),
+                "likes": int(stats.get("likeCount", 0)),
+                "comments": int(stats.get("commentCount", 0)),
+            }
+        )
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["publishedAt"] = pd.to_datetime(df["publishedAt"])
+    return df
+
+# ----------------------------------------------------
+# 4. FETCH DATA
+# ----------------------------------------------------
+if API_KEY == "YOUR_API_KEY_HERE":
+    st.warning("Set your YouTube Data API key in the code or as YOUTUBE_API_KEY env variable.")
+else:
+    with st.spinner("Loading data from YouTube..."):
+        uploads_pid = get_uploads_playlist_id(channel_id)
+        if uploads_pid is None:
+            st.error("Channel not found. Check the Channel ID.")
+        else:
+            video_ids, _ = get_videos_from_playlist(uploads_pid, max_results=max_results)
+            df_videos = get_video_stats(video_ids)
+
+            if df_videos.empty:
+                st.error("No videos/statistics available.")
+            else:
+                # ------------------------------------------------
+                # 5. HIGH-LEVEL METRICS (KPI CARDS)
+                # ------------------------------------------------
+                total_views = int(df_videos["views"].sum())
+                total_likes = int(df_videos["likes"].sum())
+                total_comments = int(df_videos["comments"].sum())
+                total_videos = len(df_videos)
+
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("Total Views", f"{total_views:,}")
+                col2.metric("Total Likes", f"{total_likes:,}")
+                col3.metric("Total Comments", f"{total_comments:,}")
+                col4.metric("Videos Analyzed", total_videos)
+
+                # ------------------------------------------------
+                # 6. TOP-PERFORMING VIDEO BAR CHART
+                # ------------------------------------------------
+                st.subheader("Top-Performing Videos")
+                df_sorted = df_videos.sort_values(by=sort_by, ascending=False)
+                top_n = st.slider("Show top N videos", 3, min(20, total_videos), 10)
+
+                fig_bar = px.bar(
+                    df_sorted.head(top_n),
+                    x="title",
+                    y=sort_by.replace("Count", "") if sort_by.endswith("Count") else sort_by,
+                    hover_data=["views", "likes", "comments", "publishedAt"],
+                    labels={"title": "Video title"},
+                )
+                fig_bar.update_layout(xaxis_tickangle=-45, height=500)
+                st.plotly_chart(fig_bar, use_container_width=True)
+
+                # ------------------------------------------------
+                # 7. SUBSCRIBER / VIEW TREND (LINE GRAPH)
+                # ------------------------------------------------
+                st.subheader("Views Trend Over Time")
+                df_time = df_videos.sort_values("publishedAt")
+                fig_line = px.line(
+                    df_time,
+                    x="publishedAt",
+                    y="views",
+                    hover_name="title",
+                    markers=True,
+                    labels={"publishedAt": "Publish date", "views": "Views"},
+                )
+                st.plotly_chart(fig_line, use_container_width=True)
+
+                # ------------------------------------------------
+                # 8. RAW DATA & FILTERS
+                # ------------------------------------------------
+                st.subheader("Raw Video Data")
+                with st.expander("Show table"):
+                    st.dataframe(df_videos)
+
+                # Simple filter example
+                min_views = st.slider(
+                    "Filter videos with at least this many views",
+                    0,
+                    int(df_videos["views"].max()),
+                    0,
+                    step=max(int(df_videos["views"].max() // 10), 1),
+                )
+                st.write("Filtered videos:")
+                st.dataframe(df_videos[df_videos["views"] >= min_views])
